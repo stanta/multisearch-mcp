@@ -8,7 +8,7 @@ from mcp.shared.session import RequestResponder  # for type only; provided by fr
 from mcp.types import Tool
 
 
-TOOL_NAME = "search"
+TOOL_NAME = "multisearch-mcp"
 CATEGORIES = ["text", "images", "news", "videos", "books"]
 
 
@@ -136,4 +136,5 @@ async def run(read_stream, write_stream, *, ddgs_factory: Optional[callable] = N
     """
     server = create_server(ddgs_factory=ddgs_factory)
     # Server.run will derive capabilities from registered handlers.
-    await server.run(read_stream, write_stream)
+    init_opts = server.create_initialization_options()
+    await server.run(read_stream, write_stream, init_opts, False, False)

@@ -1,7 +1,7 @@
 [project]
 name = "multisearch-mcp"
 version = "0.1.0"
-description = "Add your description here"
+description = "Unified multi-category DDGS MCP server exposing a single 'search' tool (text, images, news, videos, books)."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
