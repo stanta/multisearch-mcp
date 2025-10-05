@@ -1,14 +1,22 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
+from types import SimpleNamespace
+from contextlib import nullcontext
 
-import ddgs  # tests will monkeypatch ddgs.DDGS in this module namespace
+# Prefer the real ddgs package in production; tests can monkeypatch ddgs.DDGS
+try:
+    import ddgs as _ddgs  # type: ignore[import-not-found]
+    ddgs = _ddgs  # provides ddgs.DDGS
+except Exception:
+    # Fallback for environments without ddgs installed; tests will monkeypatch ddgs.DDGS
+    ddgs = SimpleNamespace(DDGS=None)
 from mcp.server.lowlevel.server import Server
 from mcp.shared.session import RequestResponder  # for type only; provided by framework
 from mcp.types import Tool
 
 
-TOOL_NAME = "multisearch-mcp"
+TOOL_NAME = "search"
 CATEGORIES = ["text", "images", "news", "videos", "books"]
 
 
@@ -43,7 +51,7 @@ def _output_schema() -> Dict[str, Any]:
     }
 
 
-def create_server(ddgs_factory: Optional[callable] = None) -> Server:
+def create_server(ddgs_factory: Optional[Callable[[], Any]] = None) -> Server:
     """
     Build and return an MCP Server with a single multiplexed 'search' tool.
     ddgs_factory: optional factory returning a DDGS-like object with methods:
@@ -68,11 +76,11 @@ def create_server(ddgs_factory: Optional[callable] = None) -> Server:
         name: str,
         arguments: Dict[str, Any],
         *,
-        responder: RequestResponder,
+        responder: Optional[RequestResponder] = None,
     ):
         if name != TOOL_NAME:
             raise ValueError(f"Unknown tool: {name}")
-        async with responder:
+        with (responder if responder is not None else nullcontext()):
             # Validate inputs
             query = arguments.get("query")
             category = arguments.get("category")
@@ -84,11 +92,10 @@ def create_server(ddgs_factory: Optional[callable] = None) -> Server:
                 raise ValueError(f"category must be one of {CATEGORIES}")
 
             # Build engine and select category method
-            ddgs_instance = factory()
-            try:
-                method = getattr(ddgs_instance, category)
-            except AttributeError as e:
-                raise ValueError(f"Unsupported category: {category}") from e
+            if factory is None:
+                # Surface a clear, structured tool error instead of crashing or closing the connection
+                raise RuntimeError("ddgs.DDGS is not available. Install the 'ddgs' package or provide ddgs_factory.")
+            engine_raw = factory()
 
             # Forward optional arguments if present
             fwd: Dict[str, Any] = {}
@@ -96,28 +103,41 @@ def create_server(ddgs_factory: Optional[callable] = None) -> Server:
                 if key in arguments and arguments[key] is not None:
                     fwd[key] = arguments[key]
 
-            # Call engine: DDGS interface expects 'keywords' for the query string
-            try:
-                results = method(keywords=query, **fwd)
-            except Exception as e:  # Map known DDGS exceptions to clearer messages
-                # Prefer explicit mapping if ddgs.exceptions are available
+            def _invoke(engine_obj: Any) -> List[Dict[str, Any]]:
                 try:
-                    TimeoutExc = ddgs.exceptions.TimeoutException  # type: ignore[attr-defined]
-                except Exception:
-                    TimeoutExc = None  # type: ignore[assignment]
-                try:
-                    DDGSExc = ddgs.exceptions.DDGSException  # type: ignore[attr-defined]
-                except Exception:
-                    DDGSExc = None  # type: ignore[assignment]
+                    method = getattr(engine_obj, category)
+                except AttributeError as e:
+                    raise ValueError(f"Unsupported category: {category}") from e
 
-                if TimeoutExc is not None and isinstance(e, TimeoutExc):
-                    # Ensure message contains "timeout" per tests
+                # Try multiple calling conventions to support different ddgs versions:
+                # 1) keywords=... (older ddgs)
+                # 2) query=... (newer ddgs)
+                # 3) positional (broad compatibility and unbound/class-level edge cases)
+                try:
+                    return method(keywords=query, **fwd)
+                except TypeError:
+                    try:
+                        return method(query=query, **fwd)
+                    except TypeError:
+                        return method(query, **fwd)
+
+            # Use context manager if supported by the engine
+            has_cm = callable(getattr(engine_raw, "__enter__", None)) and callable(getattr(engine_raw, "__exit__", None))
+            try:
+                if has_cm:
+                    with engine_raw as engine:
+                        results = _invoke(engine)
+                else:
+                    results = _invoke(engine_raw)
+            except Exception as e:
+                # Map errors by message content to avoid depending on ddgs.exceptions at import time
+                msg = str(e)
+                name = type(e).__name__.lower()
+                if "timeout" in msg.lower() or "timeout" in name:
+                    # Ensure the substring "timeout" is present as tests expect
                     raise RuntimeError(f"timeout: {e}") from e
-                if DDGSExc is not None and isinstance(e, DDGSExc):
-                    # Propagate original message content
-                    raise RuntimeError(str(e)) from e
-                # Let unknown exceptions bubble to framework
-                raise
+                # Propagate other engine errors preserving message
+                raise RuntimeError(msg) from e
 
             if results is None:
                 results = []
@@ -130,7 +150,7 @@ def create_server(ddgs_factory: Optional[callable] = None) -> Server:
     return server
 
 
-async def run(read_stream, write_stream, *, ddgs_factory: Optional[callable] = None) -> None:
+async def run(read_stream, write_stream, *, ddgs_factory: Optional[Callable[[], Any]] = None) -> None:
     """
     Run the DDGS multi-search server over provided anyio-compatible streams.
     """
