@@ -4,6 +4,10 @@ from typing import Any, Dict, List, Optional, Callable
 from types import SimpleNamespace
 from contextlib import nullcontext
 import os
+import urllib.request
+import urllib.error
+import base64
+import re
 
 # Prefer the real ddgs package in production; tests can monkeypatch ddgs.DDGS
 try:
@@ -29,6 +33,7 @@ IMAGE_TOOL = "image_search"
 NEWS_TOOL = "news_search"
 VIDEO_TOOL = "video_search"
 BOOK_TOOL = "book_search"
+FETCH_TOOL = "fetch_content"
 
 # Forwardable option keys shared by all tools
 FORWARD_KEYS = ("backend", "region", "safesearch", "page", "max_results")
@@ -81,6 +86,133 @@ def _legacy_multiplex_input_schema() -> Dict[str, Any]:
         "additionalProperties": False,
         "properties": props,
         "required": req,
+    }
+
+
+# Fetch Content tool schemas and executor
+
+def _fetch_input_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "url": {"type": "string"},
+            "timeout": {"type": "number", "default": 20},
+            "headers": {"type": "object"},
+            "max_bytes": {"type": "integer"},
+        },
+        "required": ["url"],
+    }
+
+
+def _fetch_output_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "url": {"type": "string"},
+            "status": {"type": "integer"},
+            "headers": {"type": "object"},
+            "content_type": {"type": ["string", "null"]},
+            "body": {"type": "string"},
+            "body_encoding": {"type": "string"},
+            "truncated": {"type": "boolean"},
+        },
+        "required": ["url", "status", "headers", "content_type", "body", "body_encoding", "truncated"],
+    }
+
+
+def _execute_fetch_content(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    # Validate inputs
+    url = arguments.get("url")
+    if not isinstance(url, str) or len(url.strip()) == 0:
+        raise ValueError("url is required and must be a non-empty string")
+
+    headers = arguments.get("headers") or {}
+    if headers is not None and not isinstance(headers, dict):
+        raise ValueError("headers must be an object mapping strings to strings")
+    # Ensure header keys/values are strings
+    norm_headers: Dict[str, str] = {}
+    for k, v in (headers or {}).items():
+        if not isinstance(k, str) or not isinstance(v, (str, int, float)):
+            raise ValueError("headers must be a string-to-string mapping")
+        norm_headers[str(k)] = str(v)
+
+    timeout = arguments.get("timeout", 20)
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise ValueError("timeout must be a positive number")
+
+    max_bytes = arguments.get("max_bytes")
+    if max_bytes is not None:
+        if not isinstance(max_bytes, int) or max_bytes <= 0:
+            raise ValueError("max_bytes must be a positive integer when provided")
+
+    req = urllib.request.Request(url, headers=norm_headers)
+    data: bytes
+    status: int
+    resp_headers: Dict[str, str]
+    content_type: Optional[str]
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            # Convert headers to a plain dict
+            resp_headers = {str(k): str(v) for k, v in resp.headers.items()}
+            content_type = resp_headers.get("Content-Type") or resp_headers.get("content-type")
+            data = resp.read(max_bytes) if max_bytes else resp.read()
+    except urllib.error.HTTPError as e:
+        # HTTPError is a file-like object; return status and body rather than raising a tool error
+        status = int(getattr(e, "code", 0) or 0)
+        hdrs = getattr(e, "headers", None)
+        resp_headers = {str(k): str(v) for k, v in (hdrs.items() if hdrs is not None else [])}
+        content_type = resp_headers.get("Content-Type") or resp_headers.get("content-type")
+        try:
+            data = e.read(max_bytes) if max_bytes else e.read()
+        except Exception:
+            data = b""
+    except Exception as e:
+        # Network or other errors become tool errors
+        raise RuntimeError(str(e)) from e
+
+    # Decide encoding strategy
+    def is_textual(ct: Optional[str]) -> bool:
+        if not ct:
+            return False
+        cts = ct.lower()
+        return cts.startswith("text/") or "json" in cts or "xml" in cts or "javascript" in cts
+
+    def extract_charset(ct: Optional[str]) -> Optional[str]:
+        if not ct:
+            return None
+        m = re.search(r"charset=([^;]+)", ct, re.IGNORECASE)
+        return m.group(1).strip() if m else None
+
+    body_encoding: str
+    body: str
+    if is_textual(content_type):
+        enc = extract_charset(content_type) or "utf-8"
+        try:
+            body = data.decode(enc, errors="replace")
+            body_encoding = enc
+        except Exception:
+            body = base64.b64encode(data).decode("ascii")
+            body_encoding = "base64"
+    else:
+        body = base64.b64encode(data).decode("ascii")
+        body_encoding = "base64"
+
+    # Normalize header keys to lower-case for convenience
+    lower_headers = {k.lower(): v for k, v in resp_headers.items()}
+    truncated = bool(max_bytes) and max_bytes is not None and len(data) >= int(max_bytes)
+
+    return {
+        "url": url,
+        "status": int(status),
+        "headers": lower_headers,
+        "content_type": content_type if content_type is not None else None,
+        "body": body,
+        "body_encoding": body_encoding,
+        "truncated": truncated,
     }
 
 
@@ -250,6 +382,14 @@ if mcp_tool:
         adapter = EngineAdapter(factory=factory)
         return BookSearchTool(adapter).execute(arguments)
 
+    @mcp_tool(name=FETCH_TOOL, input_schema=_fetch_input_schema(), output_schema=_fetch_output_schema())  # type: ignore[misc]
+    async def tool_fetch_content(arguments: Dict[str, Any]) -> Dict[str, Any]:
+        # Keep behavior aligned with low-level registration: controlled via env flag
+        if os.getenv("MULTISEARCH_ENABLE_FETCH", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            # Mirror server-side unknown tool behavior for symmetry when decorator API is used standalone
+            raise ValueError("Unknown tool: fetch_content")
+        return _execute_fetch_content(arguments)
+
 
 def create_server(ddgs_factory: Optional[Callable[[], Any]] = None) -> Server:
     """
@@ -272,6 +412,8 @@ def create_server(ddgs_factory: Optional[Callable[[], Any]] = None) -> Server:
 
     # Legacy shim flag (disabled by default)
     enable_legacy = os.getenv("MULTISEARCH_ENABLE_LEGACY_SEARCH", "").strip().lower() in {"1", "true", "yes", "on"}
+    # Optional fetch tool flag (disabled by default)
+    enable_fetch = True # if os.getenv("MULTISEARCH_ENABLE_FETCH", "").strip().lower() in {"1", "true", "yes", "on"} else False
 
     # Category -> tool name map for legacy multiplexed "search"
     category_to_tool: Dict[str, str] = {
@@ -293,6 +435,15 @@ def create_server(ddgs_factory: Optional[Callable[[], Any]] = None) -> Server:
             )
             for inst in tool_instances.values()
         ]
+        if enable_fetch:
+            tools.append(
+                Tool(
+                    name=FETCH_TOOL,
+                    description="Fetch URL content over HTTP(S). Returns status, headers, and body (text or base64).",
+                    inputSchema=_fetch_input_schema(),
+                    outputSchema=_fetch_output_schema(),
+                )
+            )
         if enable_legacy:
             tools.append(
                 Tool(
@@ -327,6 +478,11 @@ def create_server(ddgs_factory: Optional[Callable[[], Any]] = None) -> Server:
                 tool_name = category_to_tool[category]
                 tool = tool_instances[tool_name]
                 return tool.execute(forwarded)
+
+            if name == FETCH_TOOL:
+                if not enable_fetch:
+                    raise ValueError(f"Unknown tool: {name}")
+                return _execute_fetch_content(arguments)
 
             if name not in tool_instances:
                 raise ValueError(f"Unknown tool: {name}")
