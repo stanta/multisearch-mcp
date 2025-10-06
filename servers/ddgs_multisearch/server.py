@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Callable
 from types import SimpleNamespace
 from contextlib import nullcontext
+import os
 
 # Prefer the real ddgs package in production; tests can monkeypatch ddgs.DDGS
 try:
@@ -11,29 +12,41 @@ try:
 except Exception:
     # Fallback for environments without ddgs installed; tests will monkeypatch ddgs.DDGS
     ddgs = SimpleNamespace(DDGS=None)
+
+# Optional decorator import for additive wrappers; keep runtime safe if MCP decorator API is absent
+try:
+    from mcp.server import tool as mcp_tool  # type: ignore[attr-defined]
+except Exception:
+    mcp_tool = None  # type: ignore[assignment]
+
 from mcp.server.lowlevel.server import Server
 from mcp.shared.session import RequestResponder  # for type only; provided by framework
 from mcp.types import Tool
 
+# New per-tool names
+TEXT_TOOL = "text_search"
+IMAGE_TOOL = "image_search"
+NEWS_TOOL = "news_search"
+VIDEO_TOOL = "video_search"
+BOOK_TOOL = "book_search"
 
-TOOL_NAME = "search"
-CATEGORIES = ["text", "images", "news", "videos", "books"]
+# Forwardable option keys shared by all tools
+FORWARD_KEYS = ("backend", "region", "safesearch", "page", "max_results")
 
 
-def _input_schema() -> Dict[str, Any]:
+def _per_tool_input_schema() -> Dict[str, Any]:
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "query": {"type": "string"},
-            "category": {"type": "string", "enum": CATEGORIES},
             "backend": {"type": "string"},
             "region": {"type": "string"},
             "safesearch": {"type": "string"},
             "page": {"type": "integer", "default": 1},
             "max_results": {"type": ["integer", "null"]},
         },
-        "required": ["query", "category"],
+        "required": ["query"],
     }
 
 
@@ -51,25 +64,245 @@ def _output_schema() -> Dict[str, Any]:
     }
 
 
+def _legacy_multiplex_input_schema() -> Dict[str, Any]:
+    """
+    Back-compat schema for legacy 'search' multiplexed tool:
+    includes a required 'category' alongside the shared options.
+    """
+    schema = _per_tool_input_schema()
+    props = dict(schema["properties"])
+    props["category"] = {
+        "type": "string",
+        "enum": ["text", "images", "news", "videos", "books"],
+    }
+    req = list(schema["required"]) + ["category"]
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": props,
+        "required": req,
+    }
+
+
+class EngineAdapter:
+    """
+    Wraps ddgs.DDGS lifecycle, context manager usage, invocation compatibility,
+    error mapping, and result normalization.
+    """
+
+    def __init__(self, factory: Optional[Callable[[], Any]]) -> None:
+        self._factory = factory
+
+    def _call_method(self, method: Callable[..., Any], query: str, fwd: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # Try multiple calling conventions to support different ddgs versions:
+        # 1) keywords=... (older ddgs)
+        # 2) query=... (newer ddgs)
+        # 3) positional (broad compatibility and unbound/class-level edge cases)
+        try:
+            return method(keywords=query, **fwd)
+        except TypeError:
+            try:
+                return method(query=query, **fwd)
+            except TypeError:
+                return method(query, **fwd)
+
+    def invoke(self, category: str, query: str, **opts: Any) -> List[Dict[str, Any]]:
+        factory = self._factory
+        if factory is None:
+            # Surface a clear, structured tool error instead of crashing or closing the connection
+            raise RuntimeError("ddgs.DDGS is not available. Install the 'ddgs' package or provide ddgs_factory.")
+
+        engine_raw = factory()
+
+        def _invoke_on(engine_obj: Any) -> List[Dict[str, Any]]:
+            try:
+                method = getattr(engine_obj, category)
+            except AttributeError as e:
+                raise ValueError(f"Unsupported category: {category}") from e
+            return self._call_method(method, query, opts)
+
+        # Use context manager if supported by the engine
+        has_cm = callable(getattr(engine_raw, "__enter__", None)) and callable(getattr(engine_raw, "__exit__", None))
+        try:
+            if has_cm:
+                with engine_raw as engine:
+                    results = _invoke_on(engine)
+            else:
+                results = _invoke_on(engine_raw)
+        except Exception as e:
+            # Map errors by message content to avoid depending on ddgs.exceptions at import time
+            msg = str(e)
+            name = type(e).__name__.lower()
+            if "timeout" in msg.lower() or "timeout" in name:
+                # Ensure the substring "timeout" is present as tests expect
+                raise RuntimeError(f"timeout: {e}") from e
+            # Propagate other engine errors preserving message
+            raise RuntimeError(msg) from e
+
+        if results is None:
+            results = []
+        if not isinstance(results, list):
+            raise RuntimeError("DDGS returned a non-list result")
+
+        return results
+
+
+class SearchToolBase:
+    """
+    Base class for per-category search tools. Implements shared validation, schemas,
+    forwarding semantics, and result shaping while delegating to EngineAdapter.
+    """
+
+    name: str = ""
+    description: Optional[str] = None
+    category: str = ""
+
+    def __init__(self, adapter: EngineAdapter) -> None:
+        self._adapter = adapter
+
+    @staticmethod
+    def input_schema() -> Dict[str, Any]:
+        return _per_tool_input_schema()
+
+    @staticmethod
+    def output_schema() -> Dict[str, Any]:
+        return _output_schema()
+
+    def execute(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        # Validate inputs
+        query = arguments.get("query")
+        if not isinstance(query, str) or len(query.strip()) == 0:
+            # Raising ValueError ensures server-normalized error (isError=True)
+            raise ValueError("query is required and must be a non-empty string")
+
+        # Forward optional arguments if present
+        fwd: Dict[str, Any] = {}
+        for key in FORWARD_KEYS:
+            if key in arguments and arguments[key] is not None:
+                fwd[key] = arguments[key]
+
+        results = self._adapter.invoke(self.category, query, **fwd)
+        # Structured content result
+        return {"results": results}
+
+
+class TextSearchTool(SearchToolBase):
+    name = TEXT_TOOL
+    description = "DDGS text search"
+    category = "text"
+
+
+class ImageSearchTool(SearchToolBase):
+    name = IMAGE_TOOL
+    description = "DDGS image search"
+    category = "images"
+
+
+class NewsSearchTool(SearchToolBase):
+    name = NEWS_TOOL
+    description = "DDGS news search"
+    category = "news"
+
+
+class VideoSearchTool(SearchToolBase):
+    name = VIDEO_TOOL
+    description = "DDGS video search"
+    category = "videos"
+
+
+class BookSearchTool(SearchToolBase):
+    name = BOOK_TOOL
+    description = "DDGS book search"
+    category = "books"
+
+
+# Optional: Add thin decorator-based wrappers if MCP tool decorator is available.
+# These are additive and do not replace the low-level registration in create_server().
+if mcp_tool:
+
+    @mcp_tool(name=TEXT_TOOL, input_schema=_per_tool_input_schema(), output_schema=_output_schema())  # type: ignore[misc]
+    async def tool_text_search(arguments: Dict[str, Any]) -> Dict[str, Any]:
+        factory = getattr(ddgs, "DDGS", None)
+        adapter = EngineAdapter(factory=factory)
+        return TextSearchTool(adapter).execute(arguments)
+
+    @mcp_tool(name=IMAGE_TOOL, input_schema=_per_tool_input_schema(), output_schema=_output_schema())  # type: ignore[misc]
+    async def tool_image_search(arguments: Dict[str, Any]) -> Dict[str, Any]:
+        factory = getattr(ddgs, "DDGS", None)
+        adapter = EngineAdapter(factory=factory)
+        return ImageSearchTool(adapter).execute(arguments)
+
+    @mcp_tool(name=NEWS_TOOL, input_schema=_per_tool_input_schema(), output_schema=_output_schema())  # type: ignore[misc]
+    async def tool_news_search(arguments: Dict[str, Any]) -> Dict[str, Any]:
+        factory = getattr(ddgs, "DDGS", None)
+        adapter = EngineAdapter(factory=factory)
+        return NewsSearchTool(adapter).execute(arguments)
+
+    @mcp_tool(name=VIDEO_TOOL, input_schema=_per_tool_input_schema(), output_schema=_output_schema())  # type: ignore[misc]
+    async def tool_video_search(arguments: Dict[str, Any]) -> Dict[str, Any]:
+        factory = getattr(ddgs, "DDGS", None)
+        adapter = EngineAdapter(factory=factory)
+        return VideoSearchTool(adapter).execute(arguments)
+
+    @mcp_tool(name=BOOK_TOOL, input_schema=_per_tool_input_schema(), output_schema=_output_schema())  # type: ignore[misc]
+    async def tool_book_search(arguments: Dict[str, Any]) -> Dict[str, Any]:
+        factory = getattr(ddgs, "DDGS", None)
+        adapter = EngineAdapter(factory=factory)
+        return BookSearchTool(adapter).execute(arguments)
+
+
 def create_server(ddgs_factory: Optional[Callable[[], Any]] = None) -> Server:
     """
-    Build and return an MCP Server with a single multiplexed 'search' tool.
+    Build and return an MCP Server with five category-specific tools.
     ddgs_factory: optional factory returning a DDGS-like object with methods:
                   text/images/news/videos/books(keywords: str, **kwargs) -> list[dict]
     """
     server = Server(name="ddgs-multisearch")
     factory = ddgs_factory or ddgs.DDGS
+    adapter = EngineAdapter(factory=factory)
+
+    # Instantiate tool classes with shared adapter
+    tool_instances: Dict[str, SearchToolBase] = {
+        TEXT_TOOL: TextSearchTool(adapter),
+        IMAGE_TOOL: ImageSearchTool(adapter),
+        NEWS_TOOL: NewsSearchTool(adapter),
+        VIDEO_TOOL: VideoSearchTool(adapter),
+        BOOK_TOOL: BookSearchTool(adapter),
+    }
+
+    # Legacy shim flag (disabled by default)
+    enable_legacy = os.getenv("MULTISEARCH_ENABLE_LEGACY_SEARCH", "").strip().lower() in {"1", "true", "yes", "on"}
+
+    # Category -> tool name map for legacy multiplexed "search"
+    category_to_tool: Dict[str, str] = {
+        "text": TEXT_TOOL,
+        "images": IMAGE_TOOL,
+        "news": NEWS_TOOL,
+        "videos": VIDEO_TOOL,
+        "books": BOOK_TOOL,
+    }
 
     @server.list_tools()
     async def handle_list_tools() -> List[Tool]:
-        return [
+        tools: List[Tool] = [
             Tool(
-                name=TOOL_NAME,
-                description="Unified multi-category search via DDGS across text/images/news/videos/books.",
-                inputSchema=_input_schema(),
-                outputSchema=_output_schema(),
+                name=inst.name,
+                description=inst.description,
+                inputSchema=inst.input_schema(),
+                outputSchema=inst.output_schema(),
             )
+            for inst in tool_instances.values()
         ]
+        if enable_legacy:
+            tools.append(
+                Tool(
+                    name="search",
+                    description="Legacy multiplexed DDGS search (back-compat). Disabled by default.",
+                    inputSchema=_legacy_multiplex_input_schema(),
+                    outputSchema=_output_schema(),
+                )
+            )
+        return tools
 
     @server.call_tool()
     async def handle_call_tool(
@@ -78,74 +311,29 @@ def create_server(ddgs_factory: Optional[Callable[[], Any]] = None) -> Server:
         *,
         responder: Optional[RequestResponder] = None,
     ):
-        if name != TOOL_NAME:
-            raise ValueError(f"Unknown tool: {name}")
         with (responder if responder is not None else nullcontext()):
-            # Validate inputs
-            query = arguments.get("query")
-            category = arguments.get("category")
+            if name == "search":
+                if not enable_legacy:
+                    raise ValueError("Unknown tool: search")
+                # Validate presence of category
+                category = arguments.get("category")
+                if not isinstance(category, str) or category not in category_to_tool:
+                    raise ValueError("category is required and must be one of: text, images, news, videos, books")
 
-            if not isinstance(query, str) or len(query.strip()) == 0:
-                # Raising ValueError ensures server-normalized error (isError=True)
-                raise ValueError("query is required and must be a non-empty string")
-            if category not in CATEGORIES:
-                raise ValueError(f"category must be one of {CATEGORIES}")
+                # Forward to the corresponding per-category tool after removing 'category'
+                forwarded = dict(arguments)
+                forwarded.pop("category", None)
 
-            # Build engine and select category method
-            if factory is None:
-                # Surface a clear, structured tool error instead of crashing or closing the connection
-                raise RuntimeError("ddgs.DDGS is not available. Install the 'ddgs' package or provide ddgs_factory.")
-            engine_raw = factory()
+                tool_name = category_to_tool[category]
+                tool = tool_instances[tool_name]
+                return tool.execute(forwarded)
 
-            # Forward optional arguments if present
-            fwd: Dict[str, Any] = {}
-            for key in ("backend", "region", "safesearch", "page", "max_results"):
-                if key in arguments and arguments[key] is not None:
-                    fwd[key] = arguments[key]
+            if name not in tool_instances:
+                raise ValueError(f"Unknown tool: {name}")
 
-            def _invoke(engine_obj: Any) -> List[Dict[str, Any]]:
-                try:
-                    method = getattr(engine_obj, category)
-                except AttributeError as e:
-                    raise ValueError(f"Unsupported category: {category}") from e
-
-                # Try multiple calling conventions to support different ddgs versions:
-                # 1) keywords=... (older ddgs)
-                # 2) query=... (newer ddgs)
-                # 3) positional (broad compatibility and unbound/class-level edge cases)
-                try:
-                    return method(keywords=query, **fwd)
-                except TypeError:
-                    try:
-                        return method(query=query, **fwd)
-                    except TypeError:
-                        return method(query, **fwd)
-
-            # Use context manager if supported by the engine
-            has_cm = callable(getattr(engine_raw, "__enter__", None)) and callable(getattr(engine_raw, "__exit__", None))
-            try:
-                if has_cm:
-                    with engine_raw as engine:
-                        results = _invoke(engine)
-                else:
-                    results = _invoke(engine_raw)
-            except Exception as e:
-                # Map errors by message content to avoid depending on ddgs.exceptions at import time
-                msg = str(e)
-                name = type(e).__name__.lower()
-                if "timeout" in msg.lower() or "timeout" in name:
-                    # Ensure the substring "timeout" is present as tests expect
-                    raise RuntimeError(f"timeout: {e}") from e
-                # Propagate other engine errors preserving message
-                raise RuntimeError(msg) from e
-
-            if results is None:
-                results = []
-            if not isinstance(results, list):
-                raise RuntimeError("DDGS returned a non-list result")
-
-            # Structured content result
-            return {"results": results}
+            tool = tool_instances[name]
+            # Delegate to the tool class (includes validation, forwarding, errors, normalization)
+            return tool.execute(arguments)
 
     return server
 

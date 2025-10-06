@@ -2,17 +2,17 @@
 
 Unified multi-category DuckDuckGo Search (DDGS) Model Context Protocol (MCP) server.
 
-This server exposes a single tool, "search", that multiplexes DDGS categories:
-- text
-- images
-- news
-- videos
-- books
+This server exposes five tools, one per DDGS category:
+- text_search
+- image_search
+- news_search
+- video_search
+- book_search
 
-The tool forwards common DDGS options (backend, region, safesearch, page, max_results) and returns a normalized object with "results": [].
+All tools forward common DDGS options (backend, region, safesearch, page, max_results) and return a normalized object with "results": [].
 
 ## Features
-- One tool for multiple search categories (text/images/news/videos/books)
+- Five dedicated tools for search categories (text/images/news/videos/books)
 - Pass-through of key DDGS parameters
 - Simple structured output for easy client consumption
 - Clear error mapping for timeouts and engine errors
@@ -40,10 +40,9 @@ Typical MCP hosts allow configuring a "python module" server by referencing the 
 
 ## Tool contract
 
-- Name: "search"
-- Input schema (properties):
+- Names: "text_search", "image_search", "news_search", "video_search", "book_search"
+- Shared input schema (properties):
   - query: string (required, non-empty)
-  - category: string enum ["text","images","news","videos","books"] (required)
   - backend: string (optional)
   - region: string (optional)
   - safesearch: string (optional)
@@ -52,10 +51,9 @@ Typical MCP hosts allow configuring a "python module" server by referencing the 
 - Output schema:
   - results: array of objects (category-specific shapes as provided by DDGS)
 
-### Example call (images)
+### Example call: tool "image_search" (images)
 Input:
 {
-  "category": "images",
   "query": "python logo",
   "max_results": 2
 }
@@ -75,6 +73,28 @@ Output:
 - Other DDGS exceptions → RuntimeError with the original message
 - Unknown exceptions bubble to the host framework
 
+### Optional decorator wrappers (additive)
+If the MCP decorator API is available, the module exposes thin decorator-based functions for each tool:
+- [python.async def tool_text_search(arguments: Dict[str, Any])](servers/ddgs_multisearch/server.py:226)
+- [python.async def tool_image_search(arguments: Dict[str, Any])](servers/ddgs_multisearch/server.py:231)
+- [python.async def tool_news_search(arguments: Dict[str, Any])](servers/ddgs_multisearch/server.py:237)
+- [python.async def tool_video_search(arguments: Dict[str, Any])](servers/ddgs_multisearch/server.py:243)
+- [python.async def tool_book_search(arguments: Dict[str, Any])](servers/ddgs_multisearch/server.py:249)
+
+These wrappers are optional and only defined if the decorator import succeeds. The primary, low-level registration remains in [python.def create_server()](servers/ddgs_multisearch/server.py:255).
+
+### Legacy compatibility shim (optional)
+A back-compat multiplexed tool named "search" can be enabled via an environment flag:
+- MULTISEARCH_ENABLE_LEGACY_SEARCH=1 (accepted truthy values: "1", "true", "yes", "on")
+
+When enabled:
+- [python.def create_server()](servers/ddgs_multisearch/server.py:255) registers a legacy tool named "search".
+- Input schema matches the old multiplexed contract and includes a required "category" with enum ["text","images","news","videos","books"], in addition to the shared options.
+- Output schema matches the standard { "results": array<object> }.
+
+Behavior:
+- Calls to "search" validate "query" and "category", then delegate to the corresponding per-category tool after removing the "category" key. By default the shim is disabled and "search" is not listed.
+
 ## Development
 - Install dev deps: uv sync --group dev
 - Run tests: uv run pytest -q
@@ -84,7 +104,7 @@ See LICENSE for details.
 
 ## Add this MCP server to popular IDEs (VS Code, Cursor, Claude Desktop)
 
-The server exposes an async entrypoint [run()](servers/ddgs_multisearch/server.py:133) and builder [create_server()](servers/ddgs_multisearch/server.py:46). Most MCP clients prefer launching a local process that speaks stdio. Create a tiny launcher script and then reference it in your IDE’s MCP configuration.
+The server exposes an async entrypoint [run()](servers/ddgs_multisearch/server.py:342) and builder [create_server()](servers/ddgs_multisearch/server.py:255). Most MCP clients prefer launching a local process that speaks stdio. Create a tiny launcher script and then reference it in your IDE’s MCP configuration.
 
 1) Create a stdio launcher script
 - Save the following as [serve.py](serve.py) at the root of this repo.
@@ -104,7 +124,29 @@ if __name__ == "__main__":
 
 Notes:
 - Ensure the repo is on disk and Python can import it. If needed, set PYTHONPATH to your workspace root in the IDE config examples below.
-- The launcher calls the same [run()](servers/ddgs_multisearch/server.py:133) you can embed directly in hosts that support Python-module loading.
+- The launcher calls the same [run()](servers/ddgs_multisearch/server.py:342) you can embed directly in hosts that support Python-module loading.
+
+### Optional decorator wrappers (additive)
+If the MCP decorator API is available, the module exposes thin decorator-based functions for each tool:
+- [python.async def tool_text_search(arguments: Dict[str, Any])](servers/ddgs_multisearch/server.py:225)
+- [python.async def tool_image_search(arguments: Dict[str, Any])](servers/ddgs_multisearch/server.py:231)
+- [python.async def tool_news_search(arguments: Dict[str, Any])](servers/ddgs_multisearch/server.py:237)
+- [python.async def tool_video_search(arguments: Dict[str, Any])](servers/ddgs_multisearch/server.py:243)
+- [python.async def tool_book_search(arguments: Dict[str, Any])](servers/ddgs_multisearch/server.py:249)
+
+These wrappers are optional and only defined if the decorator import succeeds. The primary, low-level registration remains in [python.def create_server()](servers/ddgs_multisearch/server.py:255).
+
+### Legacy compatibility shim (optional)
+A back-compat multiplexed tool named "search" can be enabled via an environment flag:
+- MULTISEARCH_ENABLE_LEGACY_SEARCH=1 (accepted truthy values: "1", "true", "yes", "on")
+
+When enabled:
+- [python.def create_server()](servers/ddgs_multisearch/server.py:255) registers a legacy tool named "search".
+- Input schema matches the old multiplexed contract and includes a required "category" with enum ["text","images","news","videos","books"], in addition to the shared options.
+- Output schema matches the standard { "results": array<object> }.
+
+Behavior:
+- Calls to "search" validate "query" and "category", then delegate to the corresponding per-category tool after removing the "category" key. By default the shim is disabled and "search" is not listed.
 
 2) Visual Studio Code (GitHub Copilot MCP)
 Option A — Workspace-scoped server via [.vscode/mcp.json](.vscode/mcp.json):
@@ -200,5 +242,5 @@ Security and trust notes
 - Avoid hardcoding secrets in configs. Use environment variables or the IDE’s secret store where available.
 
 Verification
-- After adding the server, list tools in your client. You should see a single tool named "search" as declared in the tool listing handler of [create_server()](servers/ddgs_multisearch/server.py:55).
-- Try a call with category "images" and a simple query to confirm you receive a "results" array as described in the Tool contract section above.
+- After adding the server, list tools in your client. You should see five tools: text_search, image_search, news_search, video_search, book_search.
+- Try a call to the "image_search" tool with a simple query to confirm you receive a "results" array as described in the Tool contract section above.
