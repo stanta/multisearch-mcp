@@ -10,6 +10,7 @@ import base64
 import re
 
 # Prefer the real ddgs package in production; tests can monkeypatch ddgs.DDGS
+ddgs: Any  # module-like provider exposing a DDGS attribute
 try:
     import ddgs as _ddgs  # type: ignore[import-not-found]
     ddgs = _ddgs  # provides ddgs.DDGS
