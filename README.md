@@ -244,3 +244,223 @@ Security and trust notes
 Verification
 - After adding the server, list tools in your client. You should see five tools: text_search, image_search, news_search, video_search, book_search.
 - Try a call to the "image_search" tool with a simple query to confirm you receive a "results" array as described in the Tool contract section above.
+
+## Docker
+
+This project ships with a production-ready multi-stage [Dockerfile](Dockerfile) and a convenience [docker-compose.yml](docker-compose.yml) to package and run the MCP server in a portable container.
+
+Why containers for MCP?
+- Reproducible: consistent Python and dependency versions
+- Secure-by-default: non-root user, no host Python needed
+- Stdio-friendly: the image starts [python.main()](serve.py:6) which speaks MCP over stdin/stdout
+
+Build (local image):
+```bash
+docker build -t multisearch-mcp:local .
+```
+
+Run with stdio (attach stdin; MCP hosts can launch this command):
+```bash
+# The server communicates over stdin/stdout; keep -i to attach stdio.
+docker run --rm -i multisearch-mcp:local
+```
+
+Using Docker Compose (recommended for local dev):
+```bash
+# Build the image
+docker compose build
+
+# Run with stdio attached (same behavior as plain docker run -i)
+docker compose run --rm -i multisearch-mcp
+```
+
+### Ephemeral container lifecycle (auto-stop and auto-remove)
+
+- This image is intended to run ephemerally under an MCP host.
+- The MCP server exits automatically when STDIN closes (for example, when your IDE disconnects).
+- Always include --rm so Docker deletes the container when it stops.
+
+Examples:
+```bash
+# One-shot container that is removed on exit
+docker run --rm -i multisearch-mcp:local
+
+# Compose variant that removes the container when the run finishes
+docker compose run --rm -i multisearch-mcp
+```
+
+Note:
+- The image sets a stop signal in [Dockerfile](Dockerfile) so it shuts down quickly on docker stop.
+- If the container exits immediately, ensure your host keeps STDIN open (-i).
+
+Environment flags:
+- MULTISEARCH_ENABLE_LEGACY_SEARCH: enable legacy multiplexed "search" tool (default: disabled)
+- MULTISEARCH_ENABLE_FETCH: enable the "fetch_content" tool (docker-compose sets this to 1 by default)
+
+Examples:
+```bash
+docker run --rm -i \
+  -e MULTISEARCH_ENABLE_LEGACY_SEARCH=1 \
+  -e MULTISEARCH_ENABLE_FETCH=1 \
+  multisearch-mcp:local
+```
+
+Healthcheck:
+- The image defines a HEALTHCHECK that validates importability of [python.def create_server()](servers/ddgs_multisearch/server.py:395). This ensures dependencies are installed and the module is wired before marking the container healthy.
+
+Image details:
+- Multi-stage build with uv to resolve and lock Python deps from [pyproject.toml](pyproject.toml)
+- Non-root runtime user (mcpuser)
+- Entrypoint/command: `python serve.py` which launches the stdio server via [python.main()](serve.py:6)
+
+Notes for IDE MCP hosts:
+- Most IDEs spawn a local process; you can point them at `python serve.py` directly as documented above. If you prefer containerized execution, configure your host to run `docker run --rm -i multisearch-mcp:local` as the command and keep stdin attached.
+
+Troubleshooting:
+- If the container exits immediately, ensure your MCP host kept stdin open (use `-i`).
+- If you don’t see expected tools, verify env flags and list tools via your MCP client.
+### Configure IDE clients to use the Dockerized MCP server
+
+This server communicates over stdin/stdout. When running in a container you must keep STDIN attached. All examples below use the required interactive flag (-i). If your IDE allows specifying a command plus arguments for an MCP server, point it to Docker instead of a local Python process.
+
+Key command used by IDEs (build the image first as shown above):
+```bash
+docker run --rm -i multisearch-mcp:local
+```
+
+You can also use Compose:
+```bash
+docker compose run --rm -i multisearch-mcp
+```
+
+Notes:
+- Keep the -i flag so the client can speak MCP over stdio.
+- Pass any feature flags via -e (see “Environment flags” above).
+- If your IDE launches from a different working directory, prefer the plain docker run example over compose, or provide a fully-qualified -f path to your docker-compose.yml.
+
+#### Visual Studio Code (GitHub Copilot MCP) — run via Docker
+
+Option A — Workspace-scoped server via [.vscode/mcp.json](.vscode/mcp.json):
+```json
+{
+  "servers": {
+    "multisearch-mcp": {
+      "command": "docker",
+      "args": ["run", "--rm", "-i",
+        // Optional: pass feature flags
+        // NOTE: env is usually preferred (see below), but some hosts only support args.
+        // For portability, prefer the "env" block when supported by your client.
+        "multisearch-mcp:local"
+      ],
+      "env": {
+        // Optional: expose env flags to the container via Docker's -e if your host supports it.
+        // When using this env block, most hosts DO NOT automatically translate to Docker -e.
+        // In that case, add explicit "-e KEY=value" entries inside args instead.
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    }
+  }
+}
+```
+
+Option B — Global (Command Palette):
+- Run “MCP: Add Server”, choose Command type
+  - Command: docker
+  - Args: ["run","--rm","-i","multisearch-mcp:local"]
+
+Option C — CLI:
+```bash
+code --add-mcp "{\"name\":\"multisearch-mcp\",\"command\":\"docker\",\"args\":[\"run\",\"--rm\",\"-i\",\"multisearch-mcp:local\"]}"
+```
+
+To enable optional tools, add -e flags inside args, for example:
+```json
+"args": ["run","--rm","-i",
+  "-e","MULTISEARCH_ENABLE_LEGACY_SEARCH=1",
+  "-e","MULTISEARCH_ENABLE_FETCH=1",
+  "multisearch-mcp:local"
+]
+```
+
+#### Cursor — project-level [.cursor/mcp.json](.cursor/mcp.json)
+```json
+{
+  "mcpServers": {
+    "multisearch-mcp": {
+      "command": "docker",
+      "args": ["run","--rm","-i",
+        "-e","MULTISEARCH_ENABLE_FETCH=1",
+        "multisearch-mcp:local"
+      ]
+    }
+  }
+}
+```
+
+If you prefer Compose and your IDE’s working directory is the repo root:
+```json
+{
+  "mcpServers": {
+    "multisearch-mcp": {
+      "command": "docker",
+      "args": ["compose","run","--rm","-i","multisearch-mcp"]
+    }
+  }
+}
+```
+If the working directory is not the repo root, use a fully-qualified Compose file:
+```json
+{
+  "mcpServers": {
+    "multisearch-mcp": {
+      "command": "docker",
+      "args": ["compose","-f","/absolute/path/to/docker-compose.yml","run","--rm","-i","multisearch-mcp"]
+    }
+  }
+}
+```
+
+#### Claude Desktop — config file example
+Edit your Claude Desktop MCP config (platform-specific path) to use Docker as the launcher:
+```json
+{
+  "mcpServers": {
+    "multisearch-mcp": {
+      "command": "docker",
+      "args": ["run","--rm","-i",
+        "-e","MULTISEARCH_ENABLE_FETCH=1",
+        "multisearch-mcp:local"
+      ]
+    }
+  }
+}
+```
+
+#### Mapping environment variables and network access
+
+- Feature flags:
+  - MULTISEARCH_ENABLE_LEGACY_SEARCH (truthy enables legacy multiplexed "search")
+  - MULTISEARCH_ENABLE_FETCH (truthy enables the fetch_content tool)
+- Pass them via Docker:
+  - Add "-e","KEY=value" pairs in the args list for your MCP host’s Docker command.
+- Networking:
+  - This server makes outbound HTTPS requests when fetch_content is enabled. Typical Docker defaults work without extra flags. If you use a corporate proxy, inject standard proxy env variables (HTTP_PROXY/HTTPS_PROXY/NO_PROXY) with additional -e entries.
+
+#### Verification (Docker)
+
+- List tools in your MCP client after adding the server. You should see:
+  - text_search, image_search, news_search, video_search, book_search
+  - fetch_content (only if MULTISEARCH_ENABLE_FETCH is truthy)
+- Test a tool call (e.g., "image_search") and confirm the structured {"results": [...]} response.
+- If the container exits immediately, ensure your host kept stdin open (-i) and that your configuration uses "docker run --rm -i ...".
+
+### Optional: Use Docker Desktop’s MCP Toolkit (Gateway)
+
+Docker Desktop provides an MCP “gateway” that can host and manage containerized MCP servers and present them to MCP clients via a single endpoint.
+
+High-level flow:
+1) Start the gateway (via Docker Desktop UI or CLI).
+2) Register this server’s image/tag (multisearch-mcp:local) with the gateway.
+3) In your IDE’s MCP configuration, point to the gateway’s connection instead of launching Docker directly.
+
+This approach centralizes multiple MCP servers behind one connection and can simplify team setups. For details, consult Docker’s MCP Toolkit documentation. The server itself remains unchanged; it still runs [python.main()](serve.py:6) inside the container and speaks MCP over stdio.

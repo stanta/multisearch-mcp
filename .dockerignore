@@ -1,0 +1,40 @@
+# Bytecode/venv
+.venv/
+env/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Test/coverage/artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Project caches
+cache/
+build/
+dist/
+*.egg-info/
+
+# VCS/IDE
+.git/
+.gitignore
+.gitattributes
+.github/
+.vscode/
+.idea/
+.DS_Store
+
+# Not needed in image
+tests/
+*.ipynb
+*.log
+
+# Node leftover just in case
+node_modules/

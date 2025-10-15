@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  multisearch-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: multisearch-mcp:local
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MULTISEARCH_ENABLE_LEGACY_SEARCH=${MULTISEARCH_ENABLE_LEGACY_SEARCH:-0}
+      - MULTISEARCH_ENABLE_FETCH=${MULTISEARCH_ENABLE_FETCH:-1}
+    # Expose stdio for MCP hosts (run with: docker compose run --rm -i multisearch-mcp)
+    stdin_open: true
+    tty: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import importlib; importlib.import_module('servers.ddgs_multisearch.server'); print('ok')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
