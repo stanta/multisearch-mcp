@@ -99,7 +99,8 @@ def _fetch_input_schema() -> Dict[str, Any]:
         "properties": {
             "url": {"type": "string"},
             "timeout": {"type": "number", "default": 20},
-            "headers": {"type": "object"},
+            # additionalProperties: false required by OpenAI API
+            "headers": {"type": "object", "additionalProperties": False},
             "max_bytes": {"type": "integer"},
         },
         "required": ["url"],
